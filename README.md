@@ -1,0 +1,267 @@
+# BSC 多代币吸筹监控
+
+一套可以直接落地的吸筹监控小工具：
+
+- ✅ Dune SQL：一次性分析多枚 BSC 代币的 Top100 持仓和近 7 天净流入。
+- ✅ Python CLI：调用 Dune API 拉取结果，计算 0–100 的吸筹评分，并按分数排序输出。
+
+## 目录结构
+```
+accumulation-monitor/
+├─ config/
+│  └─ tokens_bsc.json       # 你维护的 BSC 代币白名单
+├─ src/
+│  ├─ dune_client.py        # 调用 Dune API
+│  ├─ analyzer.py           # 吸筹评分逻辑
+│  └─ main.py               # CLI 入口
+├─ requirements.txt
+└─ README.md
+```
+
+## 1）Dune 吸筹分析 SQL
+表名按 Dune 常用命名编写：`bsc.erc20_evt_Transfer` 和 `tokens.erc20`。如果你的环境表名略有不同（例如 `bsc_erc20.evt_Transfer`），改一下表名即可。
+
+SQL 会输出每个代币的：
+- 只买不卖的钱包数
+- 净流入总量
+- Top10/20/100 持仓集中度（当前）
+- 持币地址数量
+
+> 你可以把 `token_list` 改成 Dune 的参数（如 `ANY(:tokens)`），这样每次只传一串合约地址可以节省点数。
+
+```sql
+-- ============================
+-- BSC 多代币吸筹监控 / 吸筹雷达
+-- ============================
+
+-- TODO：把下面 IN (...) 改成你自己的代币白名单
+-- 例如: 0x..., 0x..., 0x...
+WITH token_list AS (
+    SELECT *
+    FROM (VALUES
+        -- 合约地址全部小写
+        ('0x0000000000000000000000000000000000000001'::bytea), -- UAI
+        ('0x0000000000000000000000000000000000000002'::bytea), -- TRUST
+        ('0x0000000000000000000000000000000000000003'::bytea), -- KITE
+        ('0x0000000000000000000000000000000000000004'::bytea), -- BEAT
+        ('0x0000000000000000000000000000000000000005'::bytea), -- MMT
+        ('0x0000000000000000000000000000000000000006'::bytea)  -- BANK
+        -- ... 继续补
+    ) AS t(contract_address)
+),
+
+-- 全历史转账（只针对白名单代币）
+all_transfers AS (
+    SELECT
+        evt.contract_address,
+        evt."from" AS from_addr,
+        evt."to"   AS to_addr,
+        evt.value  AS raw_value,
+        evt.evt_block_time
+    FROM bsc.erc20_evt_Transfer evt
+    JOIN token_list t ON evt.contract_address = t.contract_address
+),
+
+-- 计算当前余额（所有地址）
+balances AS (
+    SELECT
+        contract_address,
+        wallet,
+        SUM(amount_delta) AS balance
+    FROM (
+        -- 收到 = +
+        SELECT
+            contract_address,
+            to_addr AS wallet,
+            raw_value::numeric / 1e18 AS amount_delta
+        FROM all_transfers
+        UNION ALL
+        -- 发送 = -
+        SELECT
+            contract_address,
+            from_addr AS wallet,
+            - raw_value::numeric / 1e18 AS amount_delta
+        FROM all_transfers
+    ) x
+    GROUP BY 1,2
+),
+
+-- 去除余额为 0 的地址
+non_zero_balances AS (
+    SELECT *
+    FROM balances
+    WHERE balance > 0
+),
+
+-- 当前 Top100 持仓
+top_holders AS (
+    SELECT
+        contract_address,
+        wallet,
+        balance,
+        ROW_NUMBER() OVER (
+            PARTITION BY contract_address
+            ORDER BY balance DESC
+        ) AS rk
+    FROM non_zero_balances
+),
+
+top100 AS (
+    SELECT *
+    FROM top_holders
+    WHERE rk <= 100
+),
+
+-- 过去 7 天的转账（只看最近 7 天用来算净流入）
+last7d_transfers AS (
+    SELECT
+        evt.contract_address,
+        evt."from" AS from_addr,
+        evt."to"   AS to_addr,
+        evt.value::numeric / 1e18 AS amount,
+        evt.evt_block_time
+    FROM bsc.erc20_evt_Transfer evt
+    JOIN token_list t ON evt.contract_address = t.contract_address
+    WHERE evt.evt_block_time > now() - interval '7 day'
+),
+
+-- 针对 Top100 钱包，计算最近 7 天的买卖情况
+whale_flows_7d AS (
+    SELECT
+        t.contract_address,
+        t.wallet,
+        COALESCE(SUM(CASE WHEN l.to_addr   = t.wallet THEN l.amount END), 0) AS buy_7d,
+        COALESCE(SUM(CASE WHEN l.from_addr = t.wallet THEN l.amount END), 0) AS sell_7d
+    FROM top100 t
+    LEFT JOIN last7d_transfers l
+        ON t.contract_address = l.contract_address
+       AND (t.wallet = l.to_addr OR t.wallet = l.from_addr)
+    GROUP BY 1,2
+),
+
+whale_stats AS (
+    SELECT
+        contract_address,
+        COUNT(*) FILTER (WHERE buy_7d > 0) AS whales_with_buy,
+        COUNT(*) FILTER (WHERE buy_7d > 0 AND sell_7d = 0) AS whales_only_buy,
+        SUM(buy_7d - sell_7d) AS net_inflow_7d,
+        SUM(buy_7d) AS total_buy_7d,
+        SUM(sell_7d) AS total_sell_7d
+    FROM whale_flows_7d
+    GROUP BY 1
+),
+
+-- 当前持币集中度（Top10/20/100）
+concentration AS (
+    SELECT
+        contract_address,
+        SUM(balance) AS total_balance,
+        SUM(balance) FILTER (WHERE rk <= 10)  AS top10_balance,
+        SUM(balance) FILTER (WHERE rk <= 20)  AS top20_balance,
+        SUM(balance) FILTER (WHERE rk <= 100) AS top100_balance
+    FROM top100
+    GROUP BY 1
+),
+
+concentration_ratio AS (
+    SELECT
+        c.contract_address,
+        c.total_balance,
+        c.top10_balance  / NULLIF(c.total_balance,0) AS top10_ratio,
+        c.top20_balance  / NULLIF(c.total_balance,0) AS top20_ratio,
+        c.top100_balance / NULLIF(c.total_balance,0) AS top100_ratio
+    FROM concentration c
+),
+
+-- 当前持币地址数量
+holder_count AS (
+    SELECT
+        contract_address,
+        COUNT(*) AS holder_cnt
+    FROM non_zero_balances
+    GROUP BY 1
+),
+
+-- 补充 token 元数据（符号、名称）
+meta AS (
+    SELECT
+        e.contract_address,
+        e.symbol,
+        e.name
+    FROM tokens.erc20 e
+    WHERE e.chain_id = 56 -- BSC
+      AND e.contract_address IN (SELECT contract_address FROM token_list)
+)
+
+SELECT
+    encode(m.contract_address, 'hex') AS token_address,
+    m.symbol,
+    m.name,
+    ws.whales_with_buy,
+    ws.whales_only_buy,
+    ws.net_inflow_7d,
+    ws.total_buy_7d,
+    ws.total_sell_7d,
+    cr.total_balance,
+    cr.top10_ratio,
+    cr.top20_ratio,
+    cr.top100_ratio,
+    hc.holder_cnt
+FROM meta m
+LEFT JOIN whale_stats       ws ON m.contract_address = ws.contract_address
+LEFT JOIN concentration_ratio cr ON m.contract_address = cr.contract_address
+LEFT JOIN holder_count      hc ON m.contract_address = hc.contract_address
+ORDER BY ws.net_inflow_7d DESC NULLS LAST;
+```
+
+### 在 Dune 上的步骤
+1. 新建 Query 并粘贴上面的 SQL。
+2. 把 `token_list` 里的合约地址改为你的白名单（或改成参数）。
+3. 运行确认结果正常，记下 `query_id`。
+
+## 2）Python 端使用
+### 环境准备
+```bash
+python -m venv venv
+source venv/bin/activate  # Windows 用 venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+在项目根目录创建 `.env`，填好：
+```
+DUNE_API_KEY=你的_dune_api_key
+DUNE_QUERY_ID=你在 Dune 保存好的 query_id
+```
+
+编辑 `config/tokens_bsc.json`，把代币符号 + 合约地址换成你要监控的真实 BSC 代币。
+
+### 运行
+```bash
+python src/main.py
+```
+
+输出示例：
+```
+[原始 Dune 字段预览]
+  ...
+
+[按吸筹评分排序]
+|   | Symbol   | Name   | Token   |   Score |   Whales Only Buy (7D) |   Whales With Buy (7D) |   Net Inflow 7D |   Holders |   Top10 Ratio |   Top100 Ratio |
+|---|----------|--------|---------|---------|------------------------|------------------------|-----------------|-----------|---------------|----------------|
+| 0 | UAI      | ...    | ...     |   88.12 |                      3 |                      7 |           123.4 |       987 |         45.67 |          90.12 |
+```
+
+按 Score 从高到低排序，直接关注前几名即可。
+
+## 3）评分规则解读 & 地址权重说明
+默认的评分逻辑偏向“趋势感知”，每个指标先做 0~1 归一化，再按权重加总（乘以 100）：
+
+- 40% 来自 **近 7 天相对净流入**：`net_inflow_7d / total_balance`，刻画“资金流向”。
+- 25% 来自 **只买不卖的 Top100 钱包数量**：越多说明“筹码锁定”意愿越强。
+- 20% 来自 **Top100 持仓集中度**：集中度提升意味着“头部持有者吸筹”。
+- 15% 来自 **过去 7 天有买入行为的钱包数量**：衡量活跃鲸鱼数量。
+
+> 地址是否考虑权重？
+>
+> - 目前对地址的计数是“等权”的：无论某个 Top100 钱包持有 0.5% 还是 5% 的流通量，都会被当作 1 个地址计数。
+> - 如果你希望按持仓权重或流入金额加权，可以在 SQL 层额外输出每个钱包的余额占比或 7 天净流入占比，然后在 `analyzer.compute_scores` 中新增一个归一化项（例如 `whales_only_buy_weighted`），并提升它的权重即可。
