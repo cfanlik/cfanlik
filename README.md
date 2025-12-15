@@ -233,6 +233,11 @@ ORDER BY ws.net_inflow_7d DESC NULLS LAST;
 3. 可选：在 `bot_addresses` 里填入常见的 MEV / bot 地址，或改造成参数 `ANY(:bot_addresses)` 以便快速覆盖更多地址。
 4. 运行确认结果正常，记下 `query_id`。
 
+> 直接在 Dune 查看结果 vs. 通过 Python 调用 API？
+>
+> - **直接在 Dune 控制台运行**：点 “Run” 后即可看到结果表，支持导出 CSV / JSON，适合临时查看或分享截图；如果最近跑过同一个 Query，会命中 Dune 缓存，通常比从本地反复调用 API 更快。要跑多个币种，只要在参数里传一批合约地址（或改 SQL 中的 `token_list`）就能一次跑完。
+> - **Python + Dune API**：适合自动化、定时跑、二次计算（比如吸筹评分）。API 也能复用缓存，但还需要等待网络请求并在本地做数据处理。若只想看原始指标，不做评分，直接在 Dune 里运行并导出就足够了。
+
 ### DEX 成交 vs. 纯转账
 - 上面的 SQL 以 `bsc.erc20_evt_Transfer` 为主，覆盖 CEX 出入金、链上转账以及 AMM 池的 token 份额变动（因 LP 迁移/添加会产生转账）。
 - 如果你希望更精准地按“成交方向”来衡量买卖（例如区分 swap 方向、过滤路由器内部转账），可以将 `last7d_transfers` 换成基于交易的子查询，例如：
