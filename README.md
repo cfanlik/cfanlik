@@ -50,6 +50,17 @@ WITH token_list AS (
     ) AS t(contract_address)
 ),
 
+-- 可选：过滤已知 bot / MEV bot 地址，避免被刷量干扰
+-- 把列表改成你自己的地址，或改造成 ANY(:bot_addresses) 参数
+bot_addresses AS (
+    SELECT *
+    FROM (VALUES
+        ('0x00000000000000000000000000000000000000aa'::bytea),
+        ('0x00000000000000000000000000000000000000bb'::bytea)
+        -- ... 继续补
+    ) AS t(wallet)
+),
+
 -- 全历史转账（只针对白名单代币）
 all_transfers AS (
     SELECT
@@ -60,6 +71,8 @@ all_transfers AS (
         evt.evt_block_time
     FROM bsc.erc20_evt_Transfer evt
     JOIN token_list t ON evt.contract_address = t.contract_address
+    WHERE evt."from" NOT IN (SELECT wallet FROM bot_addresses)
+      AND evt."to"   NOT IN (SELECT wallet FROM bot_addresses)
 ),
 
 -- 计算当前余额（所有地址）
@@ -217,7 +230,30 @@ ORDER BY ws.net_inflow_7d DESC NULLS LAST;
 ### 在 Dune 上的步骤
 1. 新建 Query 并粘贴上面的 SQL。
 2. 把 `token_list` 里的合约地址改为你的白名单（或改成参数）。
-3. 运行确认结果正常，记下 `query_id`。
+3. 可选：在 `bot_addresses` 里填入常见的 MEV / bot 地址，或改造成参数 `ANY(:bot_addresses)` 以便快速覆盖更多地址。
+4. 运行确认结果正常，记下 `query_id`。
+
+### DEX 成交 vs. 纯转账
+- 上面的 SQL 以 `bsc.erc20_evt_Transfer` 为主，覆盖 CEX 出入金、链上转账以及 AMM 池的 token 份额变动（因 LP 迁移/添加会产生转账）。
+- 如果你希望更精准地按“成交方向”来衡量买卖（例如区分 swap 方向、过滤路由器内部转账），可以将 `last7d_transfers` 换成基于交易的子查询，例如：
+
+```sql
+-- 可替换 last7d_transfers，使用 DEX 成交表
+dex_swaps_7d AS (
+    SELECT
+        t.token_bought_address   AS contract_address,
+        t.taker                  AS to_addr,   -- 买入方
+        t.taker                  AS from_addr, -- 用于保持列名一致；卖出方向用 token_sold_address
+        t.token_bought_amount    AS amount,
+        t.block_time             AS evt_block_time
+    FROM dex.trades t
+    WHERE t.chain_id = 56
+      AND t.token_bought_address IN (SELECT contract_address FROM token_list)
+      AND t.block_time > now() - interval '7 day'
+),
+```
+
+- 具体表名在 Dune 里可能是 `bsc.dex_trades`、`dex.trades` 等，可根据你的数据源调整；核心思路是用成交方向代替单纯的资金流转账，以避免 LP 移除/路由器内部跳转带来的噪音。
 
 ## 2）Python 端使用
 ### 环境准备
@@ -234,6 +270,7 @@ DUNE_QUERY_ID=你在 Dune 保存好的 query_id
 ```
 
 编辑 `config/tokens_bsc.json`，把代币符号 + 合约地址换成你要监控的真实 BSC 代币。
+如需过滤已知 bot / MEV 地址，可在 `config/address_blocklist.json` 里维护一个本地备忘，方便同步到 Dune SQL 的 `bot_addresses`。
 
 ### 运行
 ```bash
